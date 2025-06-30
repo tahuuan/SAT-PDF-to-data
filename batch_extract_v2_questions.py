@@ -13,9 +13,51 @@ from google.genai import types
 from difflib import SequenceMatcher
 import fitz  # PyMuPDF
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from pydantic import BaseModel
+from typing import List, Optional
+from enum import Enum
 
 # Load environment variables
 load_dotenv()
+
+# Pydantic models for structured output
+class Option(BaseModel):
+    value: str
+    text: str
+
+class DifficultyLevel(str, Enum):
+    easy = "easy"
+    medium = "medium"
+    hard = "hard"
+
+class QuestionType(str, Enum):
+    math = "math"
+    reading_and_writing = "reading_and_writing"
+
+class FieldByAiGen(str, Enum):
+    difficulty_level = "difficulty_level"
+    question_type = "question_type"
+    domain = "domain"
+    skill = "skill"
+
+class SATQuestion(BaseModel):
+    id: str
+    question_text: str
+    has_figure: bool
+    difficulty_level: DifficultyLevel
+    question_type: QuestionType
+    domain: str
+    skill: str
+    is_complete: bool = True
+    options: List[Option]
+    fields_by_ai_gen: List[FieldByAiGen] = []
+    question_page: Optional[int] = None
+
+class QuestionsResponse(BaseModel):
+    totalCount: int
+    questions: List[SATQuestion]
 
 class SimplifiedBatchSATExtractor:
     def __init__(self):
@@ -28,20 +70,19 @@ class SimplifiedBatchSATExtractor:
         
         # Tracking
         self.total_questions_extracted = 0
+        self.lock = threading.Lock()  # For thread-safe operations
         
     def extract_with_retry(self, pdf_path, file_index=1, max_retries=3):
         """Extract questions from PDF with retry logic for network errors"""
         
         for attempt in range(max_retries):
             try:
-                print(f"🔄 Attempt {attempt + 1}/{max_retries} for {os.path.basename(pdf_path)}")
                 result = self.extract_questions_from_pdf(pdf_path, file_index)
                 
                 # If successful (no error key), return the result
                 if 'error' not in result:
                     return result
                 
-                # If there's an error but it's not the last attempt, retry
                 if attempt < max_retries - 1:
                     wait_time = (attempt + 1) * 2  # 2, 4, 6 seconds
                     print(f"⏳ Error occurred, waiting {wait_time}s before retry...")
@@ -50,53 +91,71 @@ class SimplifiedBatchSATExtractor:
                 else:
                     print(f"❌ All {max_retries} attempts failed for {os.path.basename(pdf_path)}")
                     return result
-                    
-            except KeyboardInterrupt:
-                print(f"⚠️ User interrupted processing")
-                raise
+
             except Exception as e:
-                print(f"❌ Attempt {attempt + 1} failed: {str(e)}")
-                
-                # If it's the last attempt, return error
-                if attempt == max_retries - 1:
-                    print(f"❌ All {max_retries} attempts failed for {os.path.basename(pdf_path)}")
-                    return {"error": f"Failed after {max_retries} attempts: {str(e)}"}
-                
-                # Wait before retry
-                wait_time = (attempt + 1) * 2  # 2, 4, 6 seconds
-                print(f"⏳ Waiting {wait_time}s before retry...")
-                time.sleep(wait_time)
+                return {"error": f"Failed after {max_retries} attempts: {str(e)}"}
         
         return {"error": "Unexpected error in retry logic"}
     
     def extract_questions_from_pdf(self, pdf_path, file_index=1):
-        """Extract questions from PDF - simple, no merging"""
-        
-        print(f"📄 Processing file {file_index}: {os.path.basename(pdf_path)}")
-        
-        # Read PDF file
+        """Extract questions from PDF using structured output"""     
         with open(pdf_path, 'rb') as f:
             pdf_data = f.read()
         
-        print(f"📊 File size: {len(pdf_data)} bytes")
-        
-        # Enhanced prompt for better extraction of question fragments and continuations
         extraction_prompt = f"""
 TASK: Extract ALL SAT questions from this PDF file ({os.path.basename(pdf_path)})
 
 CRITICAL INSTRUCTIONS FOR SPLIT PDF HANDLING:
 1. READ THE ENTIRE PDF CONTENT carefully - don't skip any text
-2. Look for BOTH complete questions AND question fragments/continuations
-3. When PDFs are split, question text may continue from previous files or continue to next files
-4. Extract EVERYTHING that could be part of a question, even if it seems incomplete
+2. When PDFs are split, question text may continue from previous files or continue to next files
+3. Extract EVERYTHING that could be part of a question, even if it seems incomplete.
+4. A question is COMPLETE if you can find BOTH the question text AND all 4 answer choices (A, B, C, D) within this PDF
+5. A question is INCOMPLETE only if the question text or options are CUT OFF and continue to another file
 
 WHAT TO EXTRACT:
-- Complete questions with full text and 4 options
-- Incomplete questions that end abruptly (like "may", "might", "would", "can", "the")  
+- Complete questions with full text and 4 options (even question and options are not in the same page)
 - Question fragments that start mid-sentence without typical question headers
 - Isolated question text that might be continuations from previous files
 - Text that looks like it could be part of a question, even without clear question markers
-- Options (A, B, C, D) that appear without clear question text above them
+- Options (A, B, C, D) that appear without clear question text above them, 
+
+DOMAIN AND SKILL CLASSIFICATION:
+Based on content, classify into:
+
+Domain: Information and Ideas
+- Skills: Central Ideas and Details; Inferences; Command of Evidence
+
+Domain: Craft and Structure  
+- Skills: Text Structure and Purpose; Cross-Text Connections; Words in Context
+
+Domain: Expression of Ideas
+- Skills: Rhetorical Synthesis; Transitions
+
+Domain: Standard English Conventions
+- Skills: Boundaries; Form, Structure, and Sense
+
+Domain: Algebra
+- Skills: Linear equations for one variable; Linear functions; Linear equations for two variables; Systems of two linear equations in two variables; Linear inequalities in one or two variables
+
+Domain: Advanced Math
+- Skills: Nonlinear functions; Nonlinear equations in one variable and systems of equations in two variables; Equivalent expressions
+
+Domain: Problem-Solving and Data Analysis
+- Skills: Ratios/rates/proportional relationships/units; Percentages; One-variable data distributions; Two-variable data models; Probability; Statistical inference; Evaluating statistical claims
+
+Domain: Geometry and Trigonometry
+- Skills: Area and volume; Lines/angles/triangles; Right triangles and trigonometry; Circles
+
+DIFFICULTY LEVELS: easy, medium, hard
+QUESTION TYPES: ONLY "math" or "reading_and_writing"
+
+FIELDS_BY_AI_GEN: If some fields are not in the question, you need to gen the fields_by_ai_gen list based on the content, list:
+- difficulty_level
+- question_type
+- domain
+- skill
+
+QUESTION PAGE: The page number of the question which is displayed in the pdf NOT count the page number of the pdf
 
 SPECIAL ATTENTION TO:
 - Text at the very beginning of the PDF (might be continuation from previous file)
@@ -105,160 +164,65 @@ SPECIAL ATTENTION TO:
 - Answer choices that appear isolated
 - Text fragments that don't have clear question structure but contain question-like content
 
-RETURN FORMAT - MUST be valid JSON only:
-{{
-    "totalCount": <number>,
-    "questions": [
-        {{
-      "id": "q_001",
-      "question_text": "Complete question with \\\\(MathJax\\\\) support and [FIGURE] placeholders",
-      "has_figure": true/false,
-      "figure_description": "Brief description if has_figure is true",
-      "figure_position": "inline",
-      "correct_answer": "A|B|C|D",
-      "explanation": "Complete explanation",
-      "difficulty_level": "easy|medium|hard",
-      "question_type": "math|reading_and_writing",
-      "domain": "Algebra|Geometry|etc",
-      "skill": "Linear Equations|etc",
-      "is_complete": true/false,
-      "notes": "Brief note if incomplete",
-      "options": [
-        {{"id": "A", "text": "Option A text"}},
-        {{"id": "B", "text": "Option B text"}},
-        {{"id": "C", "text": "Option C text"}},
-        {{"id": "D", "text": "Option D text"}}
-            ]
-        }}
-    ]
-}}
+IMPORTANT FORMATTING RULES:
+1. Use MathJax \\(formula\\) for inline math, \\[formula\\] for display math
+2. Use [FIGURE] placeholder for images/diagrams (not tables)
+3. Generate LaTeX code for tables
+4. Generate LaTeX code for bold, underline, italic text formatting
+5. Create sequential question IDs starting from q_001, q_002, etc.
+6. Set is_complete: false if question text ends abruptly or seems to continue elsewhere you don't see
+7. Don't generate explanations (will be done separately)
+8. Include fields_by_ai_gen list indicating which fields were AI-generated
 
 COMPLETENESS DETECTION:
 - is_complete: true if question has full text ending properly
 - is_complete: false if:
-  * Question text ends abruptly (like "may", "might", "would", "can", "the", "a", "an")
-  * Text seems to be a fragment or continuation
+  * Text seems to be a fragment or continuation that you don't see the full text in the whole pdf
   * Question starts mid-sentence without context
-- Add detailed notes explaining why incomplete
 
-CRITICAL RULES:
-1. Return ONLY valid JSON - no markdown, no extra text
-2. Use MathJax \\\\( \\\\) for inline math, \\\\[ \\\\] for display math
-3. Use [FIGURE] placeholder for images/diagrams not table
-4. If there is a table on question or options, gen code latex for table
-5. If in text has some words in bold, underline, italic, etc, gen code latex for that
-5. Correct answer must be exactly "A", "B", "C", or "D" (if available)
-6. Extract EVERYTHING - better to over-extract than miss question fragments
-7. Create sequential question IDs starting from q_001, q_002, etc.
-8. Don't worry about merging - just extract all content that could be questions
-9. Don't need generate explanation for each question, because we will generate explanation later   
-
-EXAMPLES:
-- "What is the value of x?" with 4 options = is_complete: true
-- "The value of x may" (cut off) = is_complete: false, notes: "Question text incomplete, continues on next page"
-- "be greater than 5 in this equation" (fragment) = is_complete: false, notes: "Question fragment, likely continuation from previous page"
-
-Extract all questions and question fragments from this PDF:
+Extract all questions and question fragments from this PDF.
 """
         
         try:
-            print("🤖 Processing with Gemini...")
-            
-            # Call API
             response = self.client.models.generate_content(
-                model="gemini-2.5-flash-preview-05-20",
+                model="gemini-2.5-pro",
                 contents=[
                     types.Part.from_bytes(
                         data=pdf_data,
                         mime_type='application/pdf',
                     ),
-                    extraction_prompt
                 ],
                 config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=50000
+                    system_instruction=extraction_prompt,                    
+                    temperature=0.7,
+                    max_output_tokens=65536,
+                    response_mime_type="application/json",
+                    response_schema=QuestionsResponse,
                 )
             )
             
-            # Extract response text
-            content = None
-            if hasattr(response, 'text') and response.text:
-                content = response.text
-            elif hasattr(response, 'candidates') and response.candidates:
-                candidate = response.candidates[0]
-                if hasattr(candidate, 'content') and candidate.content:
-                    if hasattr(candidate.content, 'parts') and candidate.content.parts:
-                        part = candidate.content.parts[0]
-                        if hasattr(part, 'text'):
-                            content = part.text
-            
-            if not content:
-                print("❌ Empty response")
-                return {"error": "Empty response"}
-            
-            content = content.strip()
-            print(f"📄 Response length: {len(content)} characters")
-            
-            # Clean response
-            if content.startswith('```json'):
-                content = content.replace('```json', '').replace('```', '').strip()
-            elif content.startswith('```'):
-                content = content.replace('```', '').strip()
-            
-            # Additional cleaning for JSON parsing issues
-            # Remove any control characters that could cause parsing errors
-            content = re.sub(r'[\x00-\x1f\x7f]', '', content)
-            
-            # Try to extract only the JSON part if there's extra content
-            json_start = content.find('{')
-            json_end = content.rfind('}') + 1
-            if json_start != -1 and json_end > json_start:
-                content = content[json_start:json_end]
-            
-            # Parse JSON
-            try:
-                parsed_json = json.loads(content)
-                questions = parsed_json.get('questions', [])
+            if hasattr(response, 'parsed') and response.parsed:
+                parsed_response = response.parsed
+                questions = parsed_response.questions
                 
                 print(f"✅ Extracted {len(questions)} questions from {os.path.basename(pdf_path)}")
                 
-                # Add file info to each question for tracking
+                # Convert to dict format for compatibility with existing code
+                questions_dict = []
                 for question in questions:
-                    question['source_file'] = os.path.basename(pdf_path)
-                    question['file_index'] = file_index
+                    question_data = question.model_dump()
+                    question_data['source_file'] = os.path.basename(pdf_path)
+                    question_data['file_index'] = file_index
+                    questions_dict.append(question_data)
                 
-                return parsed_json
+                return {
+                    "totalCount": parsed_response.totalCount,
+                    "questions": questions_dict
+                }
                 
-            except json.JSONDecodeError as e:
-                print(f"❌ JSON parsing failed: {e}")
-                print(f"📄 Raw content (first 500 chars): {content[:500]}")
-                
-                # Try to fix common JSON issues
-                try:
-                    # Fix common issues like missing commas, extra commas, etc.
-                    import json5  # More lenient JSON parser
-                    parsed_json = json5.loads(content)
-                    questions = parsed_json.get('questions', [])
-                    
-                    print(f"✅ Recovered with JSON5: {len(questions)} questions from {os.path.basename(pdf_path)}")
-                    
-                    # Add file info to each question for tracking
-                    for question in questions:
-                        question['source_file'] = os.path.basename(pdf_path)
-                        question['file_index'] = file_index
-                    
-                    return parsed_json
-                    
-                except Exception as e2:
-                    print(f"❌ JSON5 parsing also failed: {e2}")
-                
-                # Save debug file
-                debug_file = f"debug_response_{file_index}_{int(time.time())}.txt"
-                with open(debug_file, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                print(f"🐛 Raw response saved to: {debug_file}")
-                
-                return {"error": f"JSON parsing failed: {e}"}
+            else:
+                print("❌ No parsed response available")
+                return {"error": "No parsed response available"}
                 
         except Exception as e:
             print(f"❌ Error calling Gemini API: {e}")
@@ -413,8 +377,6 @@ Extract all questions and question fragments from this PDF:
                     'source_file': ' + '.join(source_files) if len(source_files) > 1 else source_files[0],
                     'file_index': current.get('file_index', 1),
                     'has_figure': current.get('has_figure', False),
-                    'figure_description': current.get('figure_description', ''),
-                    'figure_position': current.get('figure_position', ''),
                     'difficulty_level': current.get('difficulty_level', ''),
                     'question_type': current.get('question_type', ''),
                     'domain': current.get('domain', ''),
@@ -494,12 +456,13 @@ Extract all questions and question fragments from this PDF:
         
         return questions
     
-    def process_directory(self, input_dir, output_file="batch_questions_simplified.json", max_files=None):
+    def process_directory(self, input_dir, output_file="batch_questions_simplified.json", max_files=None, parallel=True):
         """Process all PDF files in directory"""
         
         print(f"🔄 SIMPLIFIED BATCH QUESTION EXTRACTION")
         print(f"📁 Input directory: {input_dir}")
         print(f"📄 Output file: {output_file}")
+        print(f"⚡ Processing mode: {'Parallel' if parallel else 'Sequential'}")
         
         # Find all PDF files
         pdf_files = []
@@ -527,56 +490,62 @@ Extract all questions and question fragments from this PDF:
         successful_files = []
         failed_files = []
         
-        for i, pdf_file in enumerate(pdf_files, 1):
-            print(f"\n{'='*60}")
-            print(f"PROCESSING FILE {i}/{len(pdf_files)}")
-            print(f"{'='*60}")
-            
-            result = self.extract_with_retry(pdf_file, i)
-            
-            if result and 'questions' in result:
-                questions = result['questions']
-                if questions:
-                    all_questions.extend(questions)
-                    successful_files.append(pdf_file)
-                    print(f"✅ SUCCESS: {len(questions)} questions extracted")
+        if parallel:
+            with ThreadPoolExecutor(max_workers=min(4, len(pdf_files))) as executor:
+                future_to_file = {}
+                for i, pdf_file in enumerate(pdf_files, 1):
+                    future = executor.submit(self.extract_with_retry, pdf_file, i)
+                    future_to_file[future] = (pdf_file, i)
+                
+                # Process completed tasks
+                completed_count = 0
+                for future in as_completed(future_to_file):
+                    pdf_file, file_index = future_to_file[future]
+                    completed_count += 1
                     
-                    # Show sample
-                    if questions:
-                        sample = questions[0]
-                    print(f"📝 Sample - Question: {sample.get('question_text', '')[:100]}...")
-                else:
-                    print(f"❌ FAILED: No questions extracted")
-                    failed_files.append(pdf_file)
-            else:
-                print(f"❌ FAILED: Error processing file")
-                failed_files.append(pdf_file)
-                if result and 'error' in result:
-                    print(f"🐛 Error: {result['error']}")
-            
-            # Show progress
-            print(f"📊 Total questions so far: {len(all_questions)}")
-            
-            # Wait between files to avoid rate limiting
-            if i < len(pdf_files):
-                print("⏳ Waiting 3 seconds...")
-                time.sleep(3)
-        
+                    print(f"\n{'='*60}")
+                    print(f"COMPLETED FILE {completed_count}/{len(pdf_files)}: {os.path.basename(pdf_file)}")
+                    print(f"{'='*60}")
+                    
+                    try:
+                        result = future.result()
+                        
+                        if result and 'questions' in result:
+                            questions = result['questions']
+                            if questions:
+                                with self.lock:  # Thread-safe access
+                                    all_questions.extend(questions)
+                                    successful_files.append(pdf_file)
+                                print(f"✅ SUCCESS: {len(questions)} questions extracted")
+                                
+                                # Show sample
+                                if questions:
+                                    sample = questions[0]
+                                    print(f"📝 Sample - Question: {sample.get('question_text', '')[:100]}...")
+                            else:
+                                print(f"❌ FAILED: No questions extracted")
+                                with self.lock:
+                                    failed_files.append(pdf_file)
+                        else:
+                            print(f"❌ FAILED: Error processing file")
+                            with self.lock:
+                                failed_files.append(pdf_file)
+                            if result and 'error' in result:
+                                print(f"🐛 Error: {result['error']}")
+                        
+                        # Show progress
+                        with self.lock:
+                            print(f"📊 Total questions so far: {len(all_questions)}")
+                            
+                    except Exception as e:
+                        print(f"❌ Exception processing {os.path.basename(pdf_file)}: {e}")
+                        with self.lock:
+                            failed_files.append(pdf_file)
         if not all_questions:
             print("❌ No questions extracted from any file!")
             return
         
-        # Post-processing pipeline
-        print(f"\n📝 POST-PROCESSING...")
-        
-        # Step 1: ONLY merge incomplete questions (is_complete: false)
-        # Keep all other questions unchanged
         merged_questions = self.merge_incomplete_questions(all_questions)
-        
-        # Step 2: Skip duplicate removal - only merge incomplete questions
-        # Note: We keep all questions, including similar ones, unless they were specifically incomplete
-        
-        # Reassign sequential IDs
         final_questions = self.reassign_question_ids(merged_questions)
         
         # Create final result
@@ -595,7 +564,6 @@ Extract all questions and question fragments from this PDF:
             }
         }
         
-        # Add file lists
         if successful_files:
             final_result["metadata"]["successful_files"] = [os.path.basename(f) for f in successful_files]
         if failed_files:
@@ -606,15 +574,6 @@ Extract all questions and question fragments from this PDF:
             with open(output_file, 'w', encoding='utf-8') as f:
                 json.dump(final_result, f, ensure_ascii=False, indent=2)
             
-            print(f"\n{'='*60}")
-            print(f"✅ EXTRACTION COMPLETED SUCCESSFULLY!")
-            print(f"{'='*60}")
-            print(f"📄 Output file: {output_file}")
-            print(f"📊 Total questions: {len(final_questions)}")
-            print(f"📊 Raw questions extracted: {len(all_questions)}")
-            print(f"📊 Incomplete questions merged: {len(all_questions) - len(final_questions)}")
-            print(f"✅ Successful files: {len(successful_files)}")
-            print(f"❌ Failed files: {len(failed_files)}")
             
             if final_questions:
                 # Show question type distribution
@@ -645,6 +604,8 @@ def main():
     parser.add_argument('input_dir', help='Directory containing PDF files')
     parser.add_argument('-o', '--output', default='batch_questions_simplified.json', help='Output JSON file')
     parser.add_argument('--max-files', type=int, default=None, help='Maximum number of files to process (for testing)')
+    parser.add_argument('--parallel', action='store_true', default=True, help='Use parallel processing (default)')
+    parser.add_argument('--sequential', action='store_true', help='Use sequential processing instead of parallel')
     
     args = parser.parse_args()
     
@@ -652,9 +613,12 @@ def main():
         print(f"❌ Directory not found: {args.input_dir}")
         return
     
+    # Determine processing mode
+    parallel_mode = args.parallel and not args.sequential
+    
     try:
         extractor = SimplifiedBatchSATExtractor()
-        extractor.process_directory(args.input_dir, args.output, max_files=args.max_files)
+        extractor.process_directory(args.input_dir, args.output, max_files=args.max_files, parallel=parallel_mode)
         
     except Exception as e:
         print(f"❌ Error: {e}")

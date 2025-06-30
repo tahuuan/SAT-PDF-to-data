@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Batch Explanation Extractor - Simplified Version
+Batch Explanation Extractor - Simplified Version with Structured Output
 Extract all explanations from PDF, then select longest version when duplicates exist
 """
 
@@ -10,9 +10,23 @@ import time
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from pydantic import BaseModel
+from typing import List, Optional
 
 # Load environment variables
 load_dotenv()
+
+# Pydantic models for structured output
+class Explanation(BaseModel):
+    id: str
+    correct_answer: str
+    explanation: str
+    is_complete: bool = True
+
+class ExplanationsResponse(BaseModel):
+    explanations: List[Explanation]
 
 class SimplifiedBatchExplanationExtractor:
     def __init__(self):
@@ -25,20 +39,18 @@ class SimplifiedBatchExplanationExtractor:
         
         # Tracking
         self.total_explanations_extracted = 0
+        self.lock = threading.Lock()  # For thread-safe operations
         
     def extract_with_retry(self, pdf_path, file_index=1, max_retries=3):
         """Extract explanations from PDF with retry logic for network errors"""
         
         for attempt in range(max_retries):
             try:
-                print(f"🔄 Attempt {attempt + 1}/{max_retries} for {os.path.basename(pdf_path)}")
                 result = self.extract_explanations_from_pdf(pdf_path, file_index)
                 
-                # If successful (no error key), return the result
                 if 'error' not in result:
                     return result
                 
-                # If there's an error but it's not the last attempt, retry
                 if attempt < max_retries - 1:
                     wait_time = (attempt + 1) * 2  # 2, 4, 6 seconds
                     print(f"⏳ Error occurred, waiting {wait_time}s before retry...")
@@ -47,27 +59,18 @@ class SimplifiedBatchExplanationExtractor:
                 else:
                     print(f"❌ All {max_retries} attempts failed for {os.path.basename(pdf_path)}")
                     return result
-                    
-            except KeyboardInterrupt:
-                print(f"⚠️ User interrupted processing")
-                raise
+
             except Exception as e:
-                print(f"❌ Attempt {attempt + 1} failed: {str(e)}")
-                
-                # If it's the last attempt, return error
                 if attempt == max_retries - 1:
-                    print(f"❌ All {max_retries} attempts failed for {os.path.basename(pdf_path)}")
                     return {"error": f"Failed after {max_retries} attempts: {str(e)}"}
                 
-                # Wait before retry
-                wait_time = (attempt + 1) * 2  # 2, 4, 6 seconds
-                print(f"⏳ Waiting {wait_time}s before retry...")
+                wait_time = (attempt + 1) * 2
                 time.sleep(wait_time)
         
         return {"error": "Unexpected error in retry logic"}
     
     def extract_explanations_from_pdf(self, pdf_path, file_index=1):
-        """Extract explanations from PDF - simple, no merging"""
+        """Extract explanations from PDF using structured output"""
         
         print(f"📄 Processing file {file_index}: {os.path.basename(pdf_path)}")
         
@@ -77,228 +80,95 @@ class SimplifiedBatchExplanationExtractor:
         
         print(f"📊 File size: {len(pdf_data)} bytes")
         
-        # Prompt with detection for incomplete explanations
+        # Enhanced extraction prompt for structured output - matching questions complexity
         extraction_prompt = f"""
 TASK: Extract ALL SAT explanations from this PDF file ({os.path.basename(pdf_path)})
 
-CRITICAL INSTRUCTIONS:
-1. Extract EVERY explanation you can find in this PDF, even if it is incomplete, each explanation is recognized by the title of the question.
-2. READ THE ENTIRE PDF CAREFULLY - scan through all pages to find complete explanations
-3. For each explanation, FIND THE COMPLETE TEXT from start to finish within this PDF
-4. If an explanation starts on one page and continues on another page within this PDF, COMBINE them into one complete explanation
-5. LOOK FOR TEXT FRAGMENTS that could be continuation of explanations from previous files:
-   - Text that starts mid-sentence without "Choice A is..." header
-   - Text that seems to continue an explanation (like "provide the best solution...")
-   - Isolated paragraphs that explain why answers are correct/incorrect
-6. CAREFULLY CHECK each explanation for completeness:
-   - COMPLETE explanations end with proper punctuation (. ! ?) and provide full reasoning
-   - INCOMPLETE explanations end abruptly with words like "may", "might", "would", "could", "because", "since", etc.
-   - INCOMPLETE explanations may continue on the next page/file
-7. Create sequential explanation IDs starting from q_001, q_002, etc.
-8. If you find an explanation that starts mid-sentence (continuing from previous page), try to extract the COMPLETE version of the question from this page
-9. If an explanation appears incomplete at the beginning or end of the page, still extract it, mark it as incomplete. DON'T IGNORE IT.
-10. If you find text that looks like explanation content but doesn't have a clear question number, still extract it as a separate explanation.
+You will get a list of PDF files that are splited from a single PDF file containing SAT explanations for questions. You will need to extract all explanations from each PDF file.
 
-EXPLANATION DETECTION RULES:
-- Each explanation typically starts with "Choice [A/B/C/D] is..." or "The answer is [A/B/C/D]..."
-- BUT ALSO look for text that continues explanations: "provide the best solution", "be the correct answer because", "result in the most accurate"
-- Explanations often include phrases like "Choice A is correct because...", "Choice B is wrong because..."
-- Look for complete reasoning that explains WHY an answer is correct AND why other choices are wrong
-- Some explanations may span multiple paragraphs or pages within this PDF
-- **IMPORTANT**: Don't ignore text fragments that seem to be explanation content even without headers
+CRITICAL INSTRUCTIONS FOR SPLIT PDF HANDLING:
+1. READ THE ENTIRE PDF CONTENT carefully - don't skip any text
+2. When PDFs are split, explanation text may continue from previous files or continue to next files
+3. If a text paragraph is started with a Question tag and followed by a choice, that is a new question and you create a new object for it. Otherwise, it is the remaining part of the previous explanation.
+- If the explanation is fully completed, you should mark is_complete is true.
+- In case the explanation is not fully meaning that may be continued in the next file, you should mark is_complete is false.
+- With the remaining part, you should consider it as a new question with is_complete is true, this is a special case for the remaining part of the previous explanation.
+4. SCAN EVERY PAGE thoroughly - explanations can appear anywhere in the document
+
+SPECIAL ATTENTION TO:
+- Text at the very beginning of the PDF (might be continuation from previous file)
+- Text at the very end of the PDF (might continue to next file)
+- Mathematical expressions, formulas, and calculations that are part of explanations
+- Answer choice comparisons and eliminations
+- Text fragments that don't have clear explanation structure but contain reasoning content
+- Multi-paragraph explanations that span across pages within this PDF
+- Tables or structured data that support answer explanations
 
 COMPLETENESS DETECTION:
-- COMPLETE: Ends with period, explains the full reasoning, mentions why the correct answer is right
-- INCOMPLETE: Ends abruptly mid-sentence, missing conclusion, ends with connecting words
-- SCAN AHEAD: If an explanation seems incomplete, look for its continuation on the next page of this PDF
+- is_complete: true if explanation has full reasoning ending properly with conclusion
+- is_complete: false if:
+  * Text seems to be a fragment or continuation
+  * Explanation starts mid-sentence without context
+  * Missing conclusion or final answer justification
 
-SPECIAL CASES TO WATCH FOR:
-- Text at the beginning of the PDF that starts mid-sentence (likely continuation from previous file)
-- Text fragments between questions that could be explanation content
-- Paragraphs that explain answer choices without clear "Choice A is..." headers
+IMPORTANT FORMATTING RULES:
+1. Use MathJax \\(formula\\) for inline math, \\[formula\\] for display math
+2. Use [FIGURE] placeholder for images/diagrams referenced in explanations
+3. Generate LaTeX code for tables that support explanations
+4. Generate LaTeX code for bold, underline, italic text formatting
+5. Create sequential explanation IDs starting from q_001, q_002, etc.
 
-FORMAT: Always return JSON in this EXACT format:
-{{
-    "explanations": [
-        {{
-            "id": "q_XXX",
-            "correct_answer": "A|B|C|D", 
-            "explanation": "Complete explanation with \\\\(MathJax\\\\) support - FIND THE FULL TEXT",
-            "is_complete": true,
-            "notes": "Optional: mention if this continues from previous file or will continue to next"
-        }}
-    ]
-}}
-
-CRITICAL RULES:
-1. FORMAT: Use exactly "id", "correct_answer", "explanation" fields + optional "is_complete", "notes"
-2. MATH: Use MathJax \\\\( \\\\) for inline, \\\\[ \\\\] for display math
-3. IDs: Sequential q_001, q_002, q_003... 
-4. ANSWERS: Must be exactly "A", "B", "C", or "D"
-5. COMPLETENESS: Set "is_complete": false ONLY if explanation truly ends abruptly and continues elsewhere
-6. THOROUGHNESS: Read through ALL pages of this PDF to find complete explanations AND text fragments
-7. Return only valid JSON - no markdown, no extra text
-
-EXAMPLES OF WHAT TO LOOK FOR:
-- TYPICAL: "Choice A is correct because it provides the most logical solution. Choice B is wrong because..."
-- FRAGMENT: "provide the best solution to the problem. Choice B is incorrect because it ignores..." (extract this too!)
-- CONTINUATION: "be the most accurate representation of the data shown in the graph." (extract as separate explanation)
-- INCOMPLETE: "Choice A is correct because it may" (clearly cut off - mark as incomplete)
-
-SPECIAL ATTENTION:
-- Don't just extract the first few lines of an explanation - find the COMPLETE explanation
-- If an explanation spans multiple pages within this PDF, combine them
-- Extract ALL explanation content, even fragments without clear headers
-- Only mark as incomplete if the explanation truly continues in another file
-- Each explanation should be as complete as possible from the content available in this PDF
-
-Extract explanations from this PDF:
+Extract all explanations and explanation fragments from this PDF with maximum accuracy and completeness.
 """
         
         try:
-            print("🤖 Processing with Gemini...")
+            print("🤖 Processing with Gemini using structured output...")
             
-            # Call API
+            # Call API with structured output
             response = self.client.models.generate_content(
-                model="gemini-2.5-flash-preview-05-20",
+                model="gemini-2.5-pro",
                 contents=[
                     types.Part.from_bytes(
                         data=pdf_data,
                         mime_type='application/pdf',
                     ),
-                    extraction_prompt
                 ],
                 config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=50000
+                    system_instruction=extraction_prompt,
+                    temperature=0.7,
+                    max_output_tokens=65536,
+                    response_mime_type="application/json",
+                    response_schema=ExplanationsResponse,
                 )
             )
             
-            # Extract response text
-            content = None
-            if hasattr(response, 'text') and response.text:
-                content = response.text
-            elif hasattr(response, 'candidates') and response.candidates:
-                candidate = response.candidates[0]
-                if hasattr(candidate, 'content') and candidate.content:
-                    if hasattr(candidate.content, 'parts') and candidate.content.parts:
-                        part = candidate.content.parts[0]
-                        if hasattr(part, 'text'):
-                            content = part.text
+            print(f"✅ Structured output received successfully")
             
-            if not content:
-                print("❌ Empty response")
-                return {"error": "Empty response"}
-            
-            content = content.strip()
-            print(f"📄 Response length: {len(content)} characters")
-            
-            # Clean response
-            if content.startswith('```json'):
-                content = content.replace('```json', '').replace('```', '').strip()
-            elif content.startswith('```'):
-                content = content.replace('```', '').strip()
-            
-            # Parse JSON
-            try:
-                parsed_json = json.loads(content)
-                explanations = parsed_json.get('explanations', [])
+            # Access parsed response directly
+            if hasattr(response, 'parsed') and response.parsed:
+                parsed_response = response.parsed
+                explanations = parsed_response.explanations
                 
                 print(f"✅ Extracted {len(explanations)} explanations from {os.path.basename(pdf_path)}")
                 
-                # Add file info to each explanation for tracking
+                # Convert to dict format for compatibility with existing code
+                explanations_dict = []
                 for explanation in explanations:
-                    explanation['source_file'] = os.path.basename(pdf_path)
-                    explanation['file_index'] = file_index
+                    explanation_data = explanation.model_dump()
+                    explanation_data['source_file'] = os.path.basename(pdf_path)
+                    explanation_data['file_index'] = file_index
+                    explanations_dict.append(explanation_data)
                 
-                return parsed_json
+                return {
+                    "explanations": explanations_dict
+                }
                 
-            except json.JSONDecodeError as e:
-                print(f"❌ JSON parsing failed: {e}")
-                print(f"📄 Raw content (first 500 chars): {content[:500]}")
-                
-                # Save debug file
-                debug_file = f"debug_explanation_{file_index}_{int(time.time())}.txt"
-                with open(debug_file, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                print(f"🐛 Raw response saved to: {debug_file}")
-                
-                return {"error": f"JSON parsing failed: {e}"}
+            else:
+                return {"error": "No parsed response available"}
             
         except Exception as e:
-            print(f"❌ Error calling Gemini API: {e}")
             return {"error": str(e)}
     
-    def find_similar_explanations(self, explanations):
-        """Find similar/duplicate explanations based on text content"""
-        
-        print("🔍 Finding similar explanations...")
-        
-        similar_groups = []
-        processed_indices = set()
-        
-        for i, exp1 in enumerate(explanations):
-            if i in processed_indices:
-                continue
-                
-            similar_group = [i]
-            exp1_text = exp1.get('explanation', '').lower().strip()
-            
-            # So sánh với các explanations còn lại
-            for j, exp2 in enumerate(explanations[i+1:], i+1):
-                if j in processed_indices:
-                    continue
-                    
-                exp2_text = exp2.get('explanation', '').lower().strip()
-                
-                # Check similarity
-                if self.are_explanations_similar(exp1_text, exp2_text):
-                    similar_group.append(j)
-                    processed_indices.add(j)
-            
-            if len(similar_group) > 1:
-                print(f"   Found similar group: {len(similar_group)} explanations")
-                similar_groups.append(similar_group)
-            
-            processed_indices.add(i)
-        
-        print(f"✅ Found {len(similar_groups)} groups of similar explanations")
-        return similar_groups
-    
-    def are_explanations_similar(self, text1, text2):
-        """Check if 2 explanation texts are similar (likely same explanation)"""
-        
-        if not text1 or not text2:
-            return False
-        
-        # Exact match
-        if text1 == text2:
-            return True
-        
-        # One is substring of the other (likely incomplete vs complete)
-        if len(text1) > 50 and len(text2) > 50:
-            shorter = text1 if len(text1) < len(text2) else text2
-            longer = text2 if len(text1) < len(text2) else text1
-            
-            # If shorter is 80%+ of longer, likely same explanation
-            if len(shorter) / len(longer) > 0.8:
-                if shorter in longer or longer in shorter:
-                    return True
-        
-        # Check for significant overlap in words
-        words1 = set(text1.split())
-        words2 = set(text2.split())
-        
-        if len(words1) > 20 and len(words2) > 20:
-            overlap = len(words1.intersection(words2))
-            min_words = min(len(words1), len(words2))
-            
-            # If 70%+ words overlap, likely similar
-            if overlap / min_words > 0.7:
-                return True
-        
-            return False
-        
     def merge_incomplete_explanations(self, explanations):
         """Merge consecutive explanations when is_complete=false with subsequent explanations until is_complete=true"""
         
@@ -345,10 +215,6 @@ Extract explanations from this PDF:
                         merged_explanation_text += ' '
                     merged_explanation_text += next_text
                     
-                    # Use answer from complete explanation if available
-                    if next_complete and next_exp.get('correct_answer'):
-                        merged_answer = next_exp.get('correct_answer')
-                    
                     source_files.append(next_exp.get('source_file', ''))
                     merged_notes.append(f"Merged with {next_id}")
                     merged_count += 1
@@ -367,7 +233,7 @@ Extract explanations from this PDF:
                     'id': merged_id,
                     'correct_answer': merged_answer,
                     'explanation': merged_explanation_text,
-                    'is_complete': True,  # Now it should be complete after merging
+                    'is_complete': True,
                     'source_file': ' + '.join(source_files) if len(source_files) > 1 else source_files[0],
                     'file_index': current.get('file_index', 1)
                 }
@@ -390,66 +256,6 @@ Extract explanations from this PDF:
         print(f"📊 After merging incomplete: {len(explanations)} → {len(merged)} explanations")
         return merged
     
-    def remove_duplicates(self, explanations):
-        """Remove duplicate explanations, keeping the longest version"""
-        
-        print(f"🧹 Removing duplicates from {len(explanations)} explanations...")
-        
-        # Find similar explanation groups
-        similar_groups = self.find_similar_explanations(explanations)
-        
-        # Track which explanations to keep
-        explanations_to_keep = []
-        explanations_to_remove = set()
-        
-        # For each group of similar explanations, keep the best one (prioritize complete ones)
-        for group_indices in similar_groups:
-            group_explanations = [explanations[i] for i in group_indices]
-            
-            # Separate complete vs incomplete explanations
-            complete_explanations = []
-            incomplete_explanations = []
-            
-            for i, explanation in enumerate(group_explanations):
-                explanation_length = len(explanation.get('explanation', ''))
-                is_complete = explanation.get('is_complete', True)  # Default to True for backward compatibility
-                
-                print(f"   Explanation {group_indices[i]}: length={explanation_length}, complete={is_complete}")
-                
-                if is_complete:
-                    complete_explanations.append((group_indices[i], explanation, explanation_length))
-                else:
-                    incomplete_explanations.append((group_indices[i], explanation, explanation_length))
-            
-            # Choose the best explanation
-            selected_index = -1
-            selected_explanation = None
-            
-            # Priority 1: If we have complete explanations, choose the longest complete one
-            if complete_explanations:
-                complete_explanations.sort(key=lambda x: x[2], reverse=True)  # Sort by length desc
-                selected_index, selected_explanation, selected_length = complete_explanations[0]
-                print(f"   ✅ Selected COMPLETE explanation {selected_index} (length: {selected_length} chars)")
-                
-            # Priority 2: If only incomplete explanations, choose the longest one
-            elif incomplete_explanations:
-                incomplete_explanations.sort(key=lambda x: x[2], reverse=True)  # Sort by length desc
-                selected_index, selected_explanation, selected_length = incomplete_explanations[0]
-                print(f"   ⚠️ Selected INCOMPLETE explanation {selected_index} (length: {selected_length} chars)")
-            
-            # Mark others for removal
-            for j in group_indices:
-                if j != selected_index:
-                    explanations_to_remove.add(j)
-        
-        # Keep explanations that are not duplicates + longest explanations from duplicate groups
-        for i, explanation in enumerate(explanations):
-            if i not in explanations_to_remove:
-                explanations_to_keep.append(explanation)
-        
-        print(f"📊 After removing duplicates: {len(explanations)} → {len(explanations_to_keep)} explanations")
-        return explanations_to_keep
-    
     def reassign_explanation_ids(self, explanations):
         """Reassign sequential explanation IDs"""
         
@@ -460,12 +266,13 @@ Extract explanations from this PDF:
         
         return explanations
     
-    def process_directory(self, input_dir, output_file="batch_explanations_simplified.json", max_files=None):
+    def process_directory(self, input_dir, output_file="batch_explanations_simplified.json", max_files=None, parallel=True):
         """Process all PDF files in directory"""
         
         print(f"🔄 SIMPLIFIED BATCH EXPLANATION EXTRACTION")
         print(f"📁 Input directory: {input_dir}")
         print(f"📄 Output file: {output_file}")
+        print(f"⚡ Processing mode: {'Parallel' if parallel else 'Sequential'}")
         
         # Find all PDF files
         pdf_files = []
@@ -493,56 +300,73 @@ Extract explanations from this PDF:
         successful_files = []
         failed_files = []
         
-        for i, pdf_file in enumerate(pdf_files, 1):
-            print(f"\n{'='*60}")
-            print(f"PROCESSING FILE {i}/{len(pdf_files)}")
-            print(f"{'='*60}")
+        if parallel:
+            # PARALLEL PROCESSING
+            print(f"🚀 Starting parallel processing with {min(4, len(pdf_files))} workers...")
             
-            result = self.extract_with_retry(pdf_file, i)
-            
-            if result and 'explanations' in result:
-                explanations = result['explanations']
-                if explanations:
-                    all_explanations.extend(explanations)
-                    successful_files.append(pdf_file)
-                    print(f"✅ SUCCESS: {len(explanations)} explanations extracted")
+            with ThreadPoolExecutor(max_workers=min(4, len(pdf_files))) as executor:
+                # Submit all tasks
+                future_to_file = {}
+                for i, pdf_file in enumerate(pdf_files, 1):
+                    future = executor.submit(self.extract_with_retry, pdf_file, i)
+                    future_to_file[future] = (pdf_file, i)
+                
+                # Process completed tasks
+                completed_count = 0
+                for future in as_completed(future_to_file):
+                    pdf_file, file_index = future_to_file[future]
+                    completed_count += 1
                     
-                    # Show sample
-                    if explanations:
-                        sample = explanations[0]
-                        print(f"📝 Sample - Explanation: {sample.get('explanation', '')[:100]}...")
-                else:
-                    print(f"❌ FAILED: No explanations extracted")
-                    failed_files.append(pdf_file)
-            else:
-                print(f"❌ FAILED: Error processing file")
-                failed_files.append(pdf_file)
-                if result and 'error' in result:
-                    print(f"🐛 Error: {result['error']}")
-            
-            # Show progress
-            print(f"📊 Total explanations so far: {len(all_explanations)}")
-            
-            # Wait between files to avoid rate limiting
-            if i < len(pdf_files):
-                print("⏳ Waiting 3 seconds...")
-                time.sleep(3)
+                    print(f"\n{'='*60}")
+                    print(f"COMPLETED FILE {completed_count}/{len(pdf_files)}: {os.path.basename(pdf_file)}")
+                    print(f"{'='*60}")
+                    
+                    try:
+                        result = future.result()
+                        
+                        if result and 'explanations' in result:
+                            explanations = result['explanations']
+                            if explanations:
+                                with self.lock:  # Thread-safe access
+                                    all_explanations.extend(explanations)
+                                    successful_files.append(pdf_file)
+                            else:
+                                with self.lock:
+                                    failed_files.append(pdf_file)
+                        else:
+                            print(f"❌ FAILED: Error processing file")
+                            with self.lock:
+                                failed_files.append(pdf_file)
+                            if result and 'error' in result:
+                                print(f"🐛 Error: {result['error']}")
+                        
+                        # Show progress
+                        with self.lock:
+                            print(f"📊 Total explanations so far: {len(all_explanations)}")
+                            
+                    except Exception as e:
+                        print(f"❌ Exception processing {os.path.basename(pdf_file)}: {e}")
+                        with self.lock:
+                            failed_files.append(pdf_file)
         
         if not all_explanations:
             print("❌ No explanations extracted from any file!")
             return
         
-        # Post-processing pipeline
+        # SIMPLIFIED Post-processing pipeline - ONLY merge incomplete explanations
         print(f"\n📝 POST-PROCESSING...")
         
+        # IMPORTANT: Parallel processing works because:
+        # 1. Each explanation is tagged with file_index for proper ordering
+        # 2. merge_incomplete_explanations() sorts by file_index before merging
+        # 3. The merge logic only depends on sorted order, not processing order
+        print(f"🔄 Sorting explanations by file order before merging...")
+        
         # Step 1: ONLY merge incomplete explanations (is_complete: false)
-        # Keep all other explanations unchanged
+        # This handles explanations that are split across PDF files
         merged_explanations = self.merge_incomplete_explanations(all_explanations)
         
-        # Step 2: Skip duplicate removal - only merge incomplete explanations
-        # Note: We keep all explanations, including similar ones, unless they were specifically incomplete
-        
-        # Reassign sequential IDs
+        # Step 2: Reassign sequential IDs
         final_explanations = self.reassign_explanation_ids(merged_explanations)
         
         # Create final result
@@ -553,9 +377,10 @@ Extract explanations from this PDF:
                 "total_files_successful": len(successful_files),
                 "total_files_failed": len(failed_files),
                 "total_raw_explanations": len(all_explanations),
-                "total_unique_explanations": len(final_explanations),
+                "total_final_explanations": len(final_explanations),
+                "incomplete_explanations_merged": len(all_explanations) - len(final_explanations),
                 "extraction_date": time.strftime('%Y-%m-%d %H:%M:%S'),
-                "extraction_method": "simplified_batch",
+                "extraction_method": "simplified_parallel_batch",
                 "model_used": "gemini-2.5-flash-preview-05-20"
             }
         }
@@ -599,6 +424,8 @@ def main():
     parser.add_argument('input_dir', help='Directory containing PDF files')
     parser.add_argument('-o', '--output', default='batch_explanations_simplified.json', help='Output JSON file')
     parser.add_argument('--max-files', type=int, default=None, help='Maximum number of files to process (for testing)')
+    parser.add_argument('--parallel', action='store_true', default=True, help='Use parallel processing (default)')
+    parser.add_argument('--sequential', action='store_true', help='Use sequential processing instead of parallel')
     
     args = parser.parse_args()
     
@@ -606,9 +433,12 @@ def main():
         print(f"❌ Directory not found: {args.input_dir}")
         return
     
+    # Determine processing mode
+    parallel_mode = args.parallel and not args.sequential
+    
     try:
         extractor = SimplifiedBatchExplanationExtractor()
-        extractor.process_directory(args.input_dir, args.output, max_files=args.max_files)
+        extractor.process_directory(args.input_dir, args.output, max_files=args.max_files, parallel=parallel_mode)
         
     except Exception as e:
         print(f"❌ Error: {e}")
